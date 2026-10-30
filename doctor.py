@@ -49,6 +49,12 @@ def number(value):
     except (TypeError, ValueError):
         return None
 
+def read(path):
+    try:
+        return Path(path).read_text().strip()
+    except (OSError, UnicodeDecodeError):
+        return ""
+
 class Runner:
     def __call__(self, args, timeout=5, allowed=(0,)):
         command = shlex.join(args)
@@ -127,6 +133,8 @@ BENIGN_JOURNAL = (
 # 90s by design (Tjmax 95-100°C), so a flat 85°C rule flags normal load as a problem.
 CPU_LIMITS = (("k10temp", 95, 100), ("zenpower", 95, 100), ("coretemp", 95, 100))
 DEFAULT_LIMITS = (85, 95)
+DRM = Path("/sys/class/drm")
+INTEL_DRIVERS = ("i915", "xe")
 
 def sensor_limits(tree):
     """(label, current, warn, critical, source) per sensor, using the hardware's own limits when it has them."""
@@ -439,14 +447,69 @@ class Probes:
             m = {"gpu_temperature_c": temp, "gpu_pct": max(r[2] for r in readings), "vram_used_pct": max(r[3] / r[4] * 100 for r in readings)}
             return result("gpu", "gpu", "Graphics & driver", "bad" if temp >= 90 else "warn" if temp >= 82 else "ok",
                 f"{len(readings)} GPU(s) responding · highest {temp:.0f}°C.", p["output"], "nvidia-smi", m)
-        for path in Path("/sys/class/drm").glob("card[0-9]*/device/gpu_busy_percent"):
+        cards = sorted(c for c in DRM.glob("card[0-9]*") if re.fullmatch(r"card\d+", c.name))
+        # A missing nvidia-smi on an NVIDIA machine must not be masked by another GPU's healthy reading.
+        if any(read(c / "device/vendor") == "0x10de" for c in cards):
+            return unavailable("gpu", "gpu", "Graphics & driver", p)
+        for path in DRM.glob("card[0-9]*/device/gpu_busy_percent"):
             try:
                 busy = number(path.read_text().strip())
                 if busy is not None and 0 <= busy <= 100:
                     return result("gpu", "gpu", "Graphics & driver", "ok", f"DRM GPU reports {busy:.0f}% activity.", str(path), "lspci -k", {"gpu_pct": busy})
             except OSError:
                 pass
+        intel = [c for c in cards if (c / "device/driver").resolve().name in INTEL_DRIVERS]
+        if intel:
+            return self.intel_gpu(intel)
         return unavailable("gpu", "gpu", "Graphics & driver", p)
+
+    def intel_gpu(self, cards):
+        """Intel i915/xe expose no temperature or utilization; read frequency, throttle flags and RC6 idle residency."""
+        def gts(card):
+            # i915: cardN/gt/gtM with rps_* and throttle_reason_*; xe: device/tileT/gtM/freq0 and freq0/throttle.
+            for gt in sorted(card.glob("gt/gt[0-9]*")):
+                yield (gt, gt / "rps_act_freq_mhz", gt / "rps_RP0_freq_mhz", gt / "throttle_reason_status",
+                       gt / "throttle_reason_thermal", gt / "throttle_reason_prochot", gt / "rc6_residency_ms")
+            for gt in sorted(card.glob("device/tile[0-9]*/gt[0-9]*")):
+                f = gt / "freq0"
+                yield (gt, f / "act_freq", f / "rp0_freq", f / "throttle/status",
+                       f / "throttle/reason_thermal", f / "throttle/reason_prochot", gt / "gtidle/idle_residency_ms")
+        engines = [(c, *g) for c in cards for g in gts(c)]
+        start = [number(read(e[7])) for e in engines]
+        t0 = time.monotonic()
+        if any(v is not None for v in start):
+            time.sleep(0.25)
+        elapsed_ms = (time.monotonic() - t0) * 1000
+        lines, freqs, busy, thermal, unknown = [], [], [], [], []
+        for (card, gt, act, rp0, status, therm, prochot, idle), before in zip(engines, start):
+            label = f"{card.name}/{gt.name} ({(card / 'device/driver').resolve().name})"
+            a, top = number(read(act)), number(read(rp0))
+            if a is None or top is None or top <= 0 or not 0 <= a <= top * 1.5:
+                unknown.append(label); lines.append(f"{label}: frequency unreadable"); continue
+            freqs.append(a)
+            hot = read(therm) == "1" or read(prochot) == "1"
+            if hot:
+                thermal.append(label)
+            line = f"{label}: {a:.0f}/{top:.0f} MHz, throttle status {read(status) or 'n/a'}{', thermal throttling' if hot else ''}"
+            after = number(read(idle))
+            if before is not None and after is not None and elapsed_ms > 0 and after >= before:
+                pct = max(0.0, min(100.0, 100 - (after - before) / elapsed_ms * 100))
+                busy.append(pct); line += f", ~{pct:.0f}% awake outside RC6"
+            lines.append(line)
+        if not freqs:
+            return result("gpu", "gpu", "Graphics & driver", "unknown",
+                "Intel graphics driver is bound but reports no readable GT state; no healthy result can be inferred.",
+                "\n".join(lines) or "No GT directories under " + ", ".join(str(c) for c in cards), "ls /sys/class/drm/card*/gt")
+        m = {"gpu_freq_mhz": max(freqs)}
+        if busy:
+            m["gpu_pct"] = max(busy)
+        summary = "Intel graphics responding · " + (f"{max(freqs):.0f} MHz" if max(freqs) else "idle (RC6)") + (f" · ~{max(busy):.0f}% active" if busy else "")
+        if thermal:
+            summary = "Intel graphics thermally throttled: " + ", ".join(thermal)
+        elif unknown:
+            summary += "; unreadable: " + ", ".join(unknown)
+        return result("gpu", "gpu", "Graphics & driver", "warn" if thermal or unknown else "ok", summary,
+            "\n".join(lines), "grep . /sys/class/drm/card*/gt/gt*/throttle_reason_* /sys/class/drm/card*/gt_act_freq_mhz", m)
 
     def battery(self):
         batteries = list(Path("/sys/class/power_supply").glob("BAT*"))

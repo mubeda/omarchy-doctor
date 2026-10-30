@@ -86,6 +86,37 @@ class Diagnostics(unittest.TestCase):
         self.assertEqual(row['state'],'bad')
         self.assertEqual(row['metrics']['gpu_temperature_c'],94)
 
+    def intel_sysfs(self,folder,driver='i915',vendor='0x8086',thermal='0',act='300'):
+        root=Path(folder); card=root/'card1'; gt=card/'gt/gt0'; gt.mkdir(parents=True)
+        drv=root/'drivers'/driver; drv.mkdir(parents=True); (card/'device').mkdir(); (card/'device/driver').symlink_to(drv)
+        (card/'device/vendor').write_text(vendor)
+        for name,value in [('rps_act_freq_mhz',act),('rps_RP0_freq_mhz','1000'),('throttle_reason_status',thermal),
+                           ('throttle_reason_thermal',thermal),('throttle_reason_prochot','0'),('rc6_residency_ms','1000')]:
+            (gt/name).write_text(value)
+        return patch.object(doctor,'DRM',root)
+
+    def test_intel_gpu_reported_without_nvidia_smi(self):
+        with tempfile.TemporaryDirectory() as folder, self.intel_sysfs(folder):
+            row=doctor.Probes(lambda *a,**kw:probe('nvidia-smi: not found',127)).gpu()
+        self.assertEqual(row['state'],'ok')
+        self.assertEqual(row['metrics']['gpu_freq_mhz'],300)
+        self.assertIn('i915',row['evidence'])
+
+    def test_intel_thermal_throttle_warns(self):
+        with tempfile.TemporaryDirectory() as folder, self.intel_sysfs(folder,thermal='1'):
+            row=doctor.Probes(lambda *a,**kw:probe('',127)).gpu()
+        self.assertEqual(row['state'],'warn')
+
+    def test_intel_unreadable_frequency_is_unknown(self):
+        with tempfile.TemporaryDirectory() as folder, self.intel_sysfs(folder,act='N/A'):
+            row=doctor.Probes(lambda *a,**kw:probe('',127)).gpu()
+        self.assertEqual(row['state'],'unknown')
+
+    def test_nvidia_card_without_smi_stays_unknown(self):
+        with tempfile.TemporaryDirectory() as folder, self.intel_sysfs(folder,vendor='0x10de'):
+            row=doctor.Probes(lambda *a,**kw:probe('',127)).gpu()
+        self.assertEqual(row['state'],'unknown')
+
     def test_drives_named_and_all_inspected(self):
         calls=[]
         def run(args,**kw):

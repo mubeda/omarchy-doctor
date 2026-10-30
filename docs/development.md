@@ -43,7 +43,7 @@ omarchy-shell nixfred.doctor recheck services
 
 The collector emits versioned JSON-lines events. `--database PATH` selects an isolated SQLite database. Scans, history reconciliation, assessments and handoffs can write Doctor's own state; they are not suitable for read-only forensic inspection of a live database. `doctor-checks.sh` is a compatibility launcher; the old TSV interface is archived under `review/baseline/`.
 
-Probes use four bounded workers, explicit command status checks and process-group cleanup on cancellation/timeouts. Missing or malformed evidence stays unknown. Journal queries are bounded to seven days and 500 records, with limited coverage shown explicitly. Temperature checks use each sensor's limits; compressed-memory devices are excluded from physical-drive SMART checks. Narrow known-harmless journal patterns keep ignored notices visible with reasons, and near-miss regression tests prevent broad suppression.
+Probes use four bounded workers, explicit command status checks and process-group cleanup on cancellation/timeouts. Missing or malformed evidence stays unknown. Journal queries are bounded to seven days and 500 records, with limited coverage shown explicitly. Temperature checks use each sensor's limits; compressed-memory devices are excluded from physical-drive SMART checks. Graphics uses `nvidia-smi` for NVIDIA, `gpu_busy_percent` for AMD, and i915/xe sysfs (frequency, throttle reasons, RC6 idle residency) for Intel, which exposes no GPU temperature; an NVIDIA device without a working `nvidia-smi` stays unknown. Narrow known-harmless journal patterns keep ignored notices visible with reasons, and near-miss regression tests prevent broad suppression.
 
 ## Agent completion contract
 
